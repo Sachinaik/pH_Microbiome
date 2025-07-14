@@ -2,4 +2,9 @@ Scripts for Plant species and pH interactions shape rhizosphere bacterial divers
 Authors:
 Sachin Naik1, Laura J. Chapin1, and Michelle L. Jones1* 
 
+1Department of Horticulture and Crop Science, The Ohio State University, Wooster, OH 44691
+ 
+*Corresponding author: M. L. Jones; E-mail: jones.1968@osu.edu
+
+
 
