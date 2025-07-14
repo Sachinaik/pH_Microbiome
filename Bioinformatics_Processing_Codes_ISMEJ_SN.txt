@@ -1,0 +1,408 @@
+###############################################################################
+# 0 ▸  Environment Set-up
+###############################################################################
+module load R/4.2.1-gnu11.2   # Load required R version
+
+###############################################################################
+# 1 ▸  Poly-GA Read Filtering (R Script executed from Bash)
+###############################################################################
+RSCRIPT=$(cat <<'EOF'
+# 1.1  ─── Directories ─────────────────────────────────────────────────────────
+input_dir   <- "/fs/ess/PAS2743/SNGH4_SoilpH_Microbiome/SNGH4_Illumina_Data/SN-413585255/Raw_Fastaq"
+output_dir  <- "/fs/ess/PAS2743/SNGH4_SoilpH_Microbiome/SN-413585255/PolyGA_Filtered"
+discard_dir <- file.path(output_dir, "Discarded")
+report_csv  <- file.path(output_dir, "polyGA_report.csv")
+
+# 1.2  ─── Packages ────────────────────────────────────────────────────────────
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("ShortRead", ask = FALSE, update = FALSE)
+library(ShortRead)
+
+# 1.3  ─── Helper Functions ────────────────────────────────────────────────────
+has_long_stretch <- function(seq, g_len = 20, a_len = 45) {
+  grepl(paste0("G{", g_len, ",}"), seq) | grepl(paste0("A{", a_len, ",}"), seq)
+}
+
+clean_pair <- function(fwd, rev, g_len = 20, a_len = 45) {
+  F <- readFastq(fwd); R <- readFastq(rev)
+  stopifnot(length(F) == length(R))
+
+  keep <- !(sapply(sread(F), has_long_stretch, g_len, a_len) |
+            sapply(sread(R), has_long_stretch, g_len, a_len))
+
+  list(cleanF = F[keep], cleanR = R[keep],
+       discF  = F[!keep], discR  = R[!keep])
+}
+
+# 1.4  ─── Processing Loop ─────────────────────────────────────────────────────
+if (!dir.exists(output_dir))  dir.create(output_dir,  recursive = TRUE)
+if (!dir.exists(discard_dir)) dir.create(discard_dir, recursive = TRUE)
+
+summary_df <- data.frame(File = character(), Total = integer(), Kept = integer())
+
+for (fwd in list.files(input_dir, "*_R1_001.fastq", full.names = TRUE)) {
+  rev <- sub("_R1_001.fastq$", "_R2_001.fastq", fwd)
+  if (!file.exists(rev)) { message("Missing reverse file for ", basename(fwd)); next }
+
+  res <- clean_pair(fwd, rev)
+  writeFastq(res$cleanF, file.path(output_dir,  basename(fwd)))
+  writeFastq(res$cleanR, file.path(output_dir,  basename(rev)))
+  writeFastq(res$discF,  file.path(discard_dir, "discarded_" %+% basename(fwd)))
+  writeFastq(res$discR,  file.path(discard_dir, "discarded_" %+% basename(rev)))
+
+  summary_df <- rbind(summary_df,
+    data.frame(File = basename(fwd), Total = length(res$cleanF) + length(res$discF),
+               Kept = length(res$cleanF)))
+  message("Processed ", basename(fwd), ": ", nrow(res$cleanF), " kept")
+}
+write.csv(summary_df, report_csv, row.names = FALSE)
+EOF
+)
+
+echo "$RSCRIPT" | R --no-save
+
+###############################################################################
+# 2 ▸  Primer Removal with Cutadapt
+###############################################################################
+cutadapt \
+  -g  "$primer_f" \
+  -g  TCGATCGGAGTGCCAGCMGCCGCGGTAA \
+  -g  ATCTGTCATGGAGTGCCAGCMGCCGCGGTAA \
+  -g  CGAGCAATCCACTCGAGTGCCAGCMGCCGCGGTAA \
+  -g  GATCAGTCGTCTCACTCGAGTGCCAGCMGCCGCGGTAA \
+  -a  "$primer_r_rc" \
+  -G  "$primer_r" \
+  -G  CGGACTTGATGTACGAACGGACTACHVGGGTWTCTAAT \
+  -G  TCAGTAGCTACGCACGGACTACHVGGGTWTCTAAT \
+  -G  GATTAGCTGCACGGACTACHVGGGTWTCTAAT \
+  -G  ATCAGCAACGGACTACHVGGGTWTCTAAT \
+  -A  "$primer_f_rc" \
+  --minimum-length 1 --maximum-length 260 \
+  --times 12 --error-rate 0.10 --discard-untrimmed --cores 28 \
+  --output "$R1_out" --paired-output "$R2_out" \
+  "$R1_in" "$R2_in"
+
+###############################################################################
+# 3 ▸  Read-Quality Inspection (R)
+###############################################################################
+Rscript - <<'EOF'
+user_lib <- "~/R/x86_64-pc-linux-gnu-library/4.2"; dir.create(user_lib, showWarnings = FALSE)
+install_if_missing <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager", repos = "https://cran.r-project.org", lib = user_lib)
+    BiocManager::install(pkg, lib = user_lib, ask = FALSE, update = FALSE)
+    library(pkg, character.only = TRUE)
+  }
+}
+install_if_missing("dada2"); install_if_missing("BiocParallel"); install_if_missing("ggplot2")
+
+library(dada2)
+path <- "~/Documents/Sachin_JonesLAB/Green_house_Experimnets/SNGH4_Micorbiome_pH/SNGH4_Illumina_Data/SN-413585255/Primer_trimmed"
+fnFs <- sort(list.files(path, "_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, "_R2_001.fastq", full.names = TRUE))
+
+pdf("quality_profiles_forward.pdf")
+for (i in seq(1, length(fnFs), by = 2)) print(plotQualityProfile(fnFs[i:min(i+1, length(fnFs))]))
+dev.off()
+
+pdf("quality_profiles_reverse.pdf")
+for (i in seq(1, length(fnRs), by = 2)) print(plotQualityProfile(fnRs[i:min(i+1, length(fnRs))]))
+dev.off()
+EOF
+
+###############################################################################
+# 4 ▸  Filtering & Trimming
+###############################################################################
+Rscript - <<'EOF'
+library(dada2); library(BiocParallel)
+path        <- "/fs/ess/PAS2743/SNGH4_SoilpH_Microbiome/SNGH4_Illumina_Data/SN-413585255/Primer_trimmed"
+output_path <- "/fs/ess/PAS2743/SNGH4_SoilpH_Microbiome/SN-413585255/Filtered"
+fnFs <- sort(list.files(path, "_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, "_R2_001.fastq", full.names = TRUE))
+sample.names <- sub("_R1_001.fastq", "", basename(fnFs))
+
+filtFs <- file.path(output_path, paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(output_path, paste0(sample.names, "_R_filt.fastq"))
+
+filterAndTrim(fnFs, filtFs, fnRs, filtRs,
+              truncLen = c(220,160), maxN = 0, maxEE = c(1,1),
+              truncQ  = 2, rm.phix = TRUE, compress = FALSE,
+              multithread = TRUE)
+EOF
+
+###############################################################################
+# 5 ▸  Error-Model Learning & Dereplication
+###############################################################################
+Rscript - <<'EOF'
+library(dada2); set.seed(1987)
+path <- "/fs/ess/PAS2743/SNGH4_SoilpH_Microbiome/SN-413585255/Filtered"
+filtFs <- sort(list.files(path, "_F_filt.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path, "_R_filt.fastq", full.names = TRUE))
+
+errF <- learnErrors(filtFs, nbases = 2.5e9, multithread = TRUE, randomize = TRUE, MAX_CONSIST = 20, verbose = TRUE)
+errR <- learnErrors(filtRs, nbases = 7e8,  multithread = TRUE, randomize = TRUE, MAX_CONSIST = 20, verbose = TRUE)
+
+saveRDS(errF, "errF.rds"); saveRDS(errR, "errR.rds")
+png("errorplot_errF.png"); plotErrors(errF, nominalQ = TRUE); dev.off()
+png("errorplot_errR.png"); plotErrors(errR, nominalQ = TRUE); dev.off()
+
+derepFs <- derepFastq(filtFs); saveRDS(derepFs, "derepFs.rds")
+derepRs <- derepFastq(filtRs); saveRDS(derepRs, "derepRs.rds")
+EOF
+
+###############################################################################
+# 6 ▸  DADA Inference, Merging, Chimera Removal
+###############################################################################
+Rscript - <<'EOF'
+library(dada2); library(BiocParallel); set.seed(1987)
+filt_path <- "/fs/ess/PAS2743/SNGH4_SoilpH_Microbiome/SN-413585255/Filtered"
+out_path  <- "/fs/scratch/PAS2743/SNFinalScripts"
+filtFs <- sort(list.files(filt_path, "_F_filt.fastq", full.names = TRUE))
+filtRs <- sort(list.files(filt_path, "_R_filt.fastq", full.names = TRUE))
+errF  <- readRDS(file.path(out_path, "errF.rds"))
+errR  <- readRDS(file.path(out_path, "errR.rds"))
+derepFs <- readRDS(file.path(out_path, "derepFs.rds"))
+derepRs <- readRDS(file.path(out_path, "derepRs.rds"))
+
+param <- MulticoreParam(workers = 40); register(param)
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, trimOverhang = TRUE, verbose = TRUE)
+saveRDS(mergers, file.path(out_path, "mergers.rds"))
+
+seqtab        <- makeSequenceTable(mergers)
+seqtab_nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE)
+saveRDS(seqtab_nochim, file.path(out_path, "seqtab_nochim.rds"))
+EOF
+
+###############################################################################
+# 7 ▸  Taxonomic Assignment
+###############################################################################
+Rscript - <<'EOF'
+library(dada2)
+seqtab_nochim <- readRDS("seqtab_nochim.rds")
+taxa <- assignTaxonomy(seqtab_nochim,
+          "taxa/silva_nr99_v138.1_train_set.fa", multithread = TRUE)
+taxaSp <- addSpecies(taxa, "taxa/silva_species_assignment_v138.1.fa")
+saveRDS(taxaSp, "taxaSp.rds")
+
+asv_headers <- paste0(">ASV_", seq_len(ncol(seqtab_nochim)))
+write(c(rbind(asv_headers, colnames(seqtab_nochim))), "ASVs.fa")
+write.table(t(seqtab_nochim), "ASVs_counts.tsv", sep = "\t", quote = FALSE, col.names = NA)
+write.table(taxaSp, "ASVs_taxonomy.tsv", sep = "\t", quote = FALSE, col.names = NA)
+EOF
+
+###############################################################################
+# 8 ▸  Contaminant Removal (decontam)
+###############################################################################
+Rscript - <<'EOF'
+library(dada2); library(decontam)
+asv_tab <- read.delim("ASVs_counts.tsv", row.names = 1, check.names = FALSE)
+neg_ctrls <- grepl("128R_F_filt.fastq|130R_F_filt.fastq|121R_F_filt.fastq", colnames(asv_tab))
+contam <- isContaminant(t(asv_tab), neg = neg_ctrls, method = "prevalence", threshold = 0.5)
+contam_asvs <- rownames(contam)[contam$contaminant]
+
+asv_tab_nc   <- asv_tab[!rownames(asv_tab) %in% contam_asvs, ]
+taxa_nc      <- readRDS("taxaSp.rds")[!rownames(readRDS("taxaSp.rds")) %in% contam_asvs, ]
+write.table(asv_tab_nc, "ASVs_counts_noContam.tsv", sep = "\t", quote = FALSE, col.names = NA)
+write.table(taxa_nc,    "ASVs_taxonomy_noContam.tsv", sep = "\t", quote = FALSE, col.names = NA)
+EOF
+
+###############################################################################
+# 8.5 ▸ ASV Quality Filtering & Abundance Thresholding
+###############################################################################
+Rscript - <<'EOF'
+library(dplyr)
+
+# Step 1: Read the ASV count table, taxa table, and FASTA file
+asv_table <- read.delim("ASVs_counts-no-contam.tsv", header = TRUE, check.names = FALSE)
+taxa_table <- read.delim("ASVs_taxonomy-no-contam.tsv", header = TRUE, check.names = FALSE)
+fasta_table <- readLines("ASVs-no-contam.fa")
+
+# Standardize column names
+colnames(asv_table)[1] <- "ASV_ID"
+colnames(taxa_table)[1] <- "ASV_ID"
+
+# Step 2: Filter by minimum total counts (>5 reads across all samples)
+asv_table_filtered <- asv_table[rowSums(asv_table[, -1], na.rm = TRUE) > 5, ]
+
+# Step 3: Filter by prevalence (ASVs present in at least 1% of samples)
+min_samples <- ceiling(0.01 * (ncol(asv_table_filtered) - 1))
+asv_table_filtered <- asv_table_filtered[rowSums(asv_table_filtered[, -1] > 0) >= min_samples, ]
+
+# Step 4: Save filtered and discarded ASV tables
+write.table(asv_table_filtered, "ASVs_counts_filtered.tsv", sep = "\t", row.names = FALSE)
+discarded_asv_table <- asv_table[!asv_table$ASV_ID %in% asv_table_filtered$ASV_ID, ]
+write.table(discarded_asv_table, "ASVs_counts_discarded.tsv", sep = "\t", row.names = FALSE)
+
+# Step 5: Filter taxa table to match filtered ASVs
+taxa_table_filtered <- taxa_table[taxa_table$ASV_ID %in% asv_table_filtered$ASV_ID, ]
+write.table(taxa_table_filtered, "ASVs_taxonomy_filtered.tsv", sep = "\t", row.names = FALSE)
+discarded_taxa_table <- taxa_table[!taxa_table$ASV_ID %in% asv_table_filtered$ASV_ID, ]
+write.table(discarded_taxa_table, "ASVs_taxonomy_discarded.tsv", sep = "\t", row.names = FALSE)
+
+# Step 6: FASTA filtering function
+filter_fasta <- function(fasta_lines, asv_ids) {
+  filtered_fasta <- character()
+  keep <- FALSE
+  for (line in fasta_lines) {
+    if (startsWith(line, ">")) {
+      asv_id <- sub(">", "", line)
+      keep <- asv_id %in% asv_ids
+    }
+    if (keep) {
+      filtered_fasta <- c(filtered_fasta, line)
+    }
+  }
+  return(filtered_fasta)
+}
+
+# Step 7: Filter FASTA sequences
+fasta_filtered <- filter_fasta(fasta_table, asv_table_filtered$ASV_ID)
+writeLines(fasta_filtered, "ASVs_sequences_filtered.fa")
+fasta_discarded <- filter_fasta(fasta_table, discarded_asv_table$ASV_ID)
+writeLines(fasta_discarded, "ASVs_sequences_discarded.fa")
+
+# Step 8: Create summary report
+cat("ASV Filtering Summary:\n")
+cat("Original ASVs:", nrow(asv_table), "\n")
+cat("Filtered ASVs:", nrow(asv_table_filtered), "\n")
+cat("Discarded ASVs:", nrow(discarded_asv_table), "\n")
+cat("Retention rate:", round(nrow(asv_table_filtered)/nrow(asv_table)*100, 2), "%\n")
+EOF
+
+###############################################################################
+# 9 ▸ Phylogenetic Tree Construction (Updated)
+###############################################################################
+Rscript - <<'EOF'
+library(DECIPHER); library(phangorn); library(phytools)
+
+# Use filtered ASV sequences for tree construction
+seqs <- readDNAStringSet("ASVs_sequences_filtered.fa")
+names(seqs) <- sub(">", "", names(seqs))
+
+alignment <- AlignSeqs(seqs, anchor = NA, verbose = FALSE)
+phang <- phyDat(as(alignment, "matrix"), type = "DNA")
+tree <- NJ(dist.ml(phang))
+fit <- optim.pml(pml(tree, phang), model = "GTR", optInv = TRUE,
+                 optGamma = TRUE, rearrangement = "stochastic",
+                 control = pml.control(trace = 0))
+
+write.tree(fit$tree, "ASV_tree_filtered.newick")
+write.nexus(fit$tree, "ASV_tree_filtered.nexus")
+pdf("ASV_tree_filtered.pdf"); plot(fit$tree, main = "Filtered ASV Phylogenetic Tree"); dev.off()
+saveRDS(fit, "ASV_tree_filtered.rds")
+EOF
+
+###############################################################################
+# 10 ▸ Phyloseq Object Creation (Updated)
+###############################################################################
+Rscript - <<'EOF'
+library(phyloseq); library(dada2)
+##metadata file
+sample_info_tab <- read.csv("metadataSoilpH.csv", header=TRUE, row.names=1,
+                            check.names=FALSE)
+seqtab.nochim <- readRDS( "filtered_seqtab.rds")
+taxa<- readRDS( "filterednochloro_taxa_no_row_names.rds")
+
+ASV <- otu_table(as.matrix(seqtab.nochim), taxa_are_rows = TRUE)
+TAX <- tax_table(as.matrix(taxa))
+META <- sample_data(sample_info_tab)
+physeq <- phyloseq(ASV, TAX, META)
+
+exclude_samples <- c("128R_F_filt.fastq", "130R_F_filt.fastq", "121R_F_filt.fastq", "129R_F_filt.fastq",
+                     "125R_F_filt.fastq", "124R_F_filt.fastq", "123R_F_filt.fastq", "122R_F_filt.fastq", 
+                     "126R_F_filt.fastq", "127R_F_filt.fastq")
+# Prune the phyloseq object to remove specified samples
+physeq_filtered <- prune_samples(!(sample_names(physeq) %in% exclude_samples), physeq)
+saveRDS(physeq_filtered, file = "physeq_filterednochloromito.rds")
+
+#Rarefraction
+# Rarefy the data to even depth
+set.seed(1987)  # Set seed for reproducibility
+physeq_rarefied <- rarefy_even_depth(physeq_filtered, rngseed = TRUE, sample.size = min(sample_sums(physeq_filtered)), replace = FALSE)
+
+# Check rarefied phyloseq object
+physeq_rarefied
+saveRDS(physeq_rarefied, file = "physeq_rarefied.rds")
+
+
+##Troubleshooting
+# Check taxa names in both objects
+physeq_taxa <- taxa_names(physeq)
+tree_taxa <- taxa_names(fitGTR$tree)
+head(tree_taxa)
+head(physeq_taxa)
+#both were different 
+# Assuming taxa_names(physeq) are DNA sequences and the ASV names are available in the tree
+
+# Create a mapping of ASV numbers to DNA sequences (assuming this is known)
+ASV_mapping <- data.frame(
+  ASV = paste0("ASV_", 1:length(tree_taxa)),  # ASV names (ASV_1, ASV_2, etc.)
+  DNA_sequence = taxa_names(physeq)           # Corresponding DNA sequences
+)
+
+# Rename taxa in the physeq object to match ASV names from the tree
+taxa_names(physeq) <- ASV_mapping$ASV[match(taxa_names(physeq), ASV_mapping$DNA_sequence)]
+
+# Ensure the renamed taxa match the tree
+physeq_filtered <- prune_taxa(tree_taxa, physeq)
+
+# Now merge the phyloseq object with the tree
+Bacteria_ps <- merge_phyloseq(physeq_filtered, phy_tree(fitGTR$tree))
+
+# Check the merged phyloseq object
+Bacteria_ps
+saveRDS(Bacteria_ps, "Bacteria_ps.rds")
+
+##Exclude all +Ve and -Ve controls
+# Define the samples you want to exclude
+exclude_samples <- c("128R_F_filt.fastq", "130R_F_filt.fastq", "121R_F_filt.fastq", "129R_F_filt.fastq",
+                     "125R_F_filt.fastq", "124R_F_filt.fastq", "123R_F_filt.fastq", "122R_F_filt.fastq", 
+                     "126R_F_filt.fastq", "127R_F_filt.fastq")
+
+# Prune the phyloseq object to exclude these samples
+Bacteria_ps_filtered <- prune_samples(!(sample_names(Bacteria_ps) %in% exclude_samples), Bacteria_ps)
+
+# Check the result
+Bacteria_ps_filtered
+
+# Define the samples you want to exclude
+exclude_samples <- c("128R_F_filt.fastq", "130R_F_filt.fastq", "121R_F_filt.fastq", "129R_F_filt.fastq",
+                     "125R_F_filt.fastq", "124R_F_filt.fastq", "123R_F_filt.fastq", "122R_F_filt.fastq", 
+                     "126R_F_filt.fastq", "127R_F_filt.fastq")
+
+# Prune the phyloseq object to exclude these samples
+Bacteria_ps_filtered <- prune_samples(!(sample_names(Bacteria_ps) %in% exclude_samples), Bacteria_ps)
+
+# Check the result
+Bacteria_ps_filtered
+
+# Prune taxa that have no counts after removing the samples
+Bacteria_ps_filtered <- prune_taxa(taxa_sums(Bacteria_ps_filtered) > 0, Bacteria_ps_filtered)
+saveRDS(Bacteria_ps_filtered, "Bacteria_ps_filtered_clean.rds")
+
+## NOTE
+## also named as file "Bacteria_ps_filtered_nochlormito.rds" both are exactly the same file
+###> Bacteria_ps_filtered_clean
+phyloseq-class experiment-level object
+otu_table()   OTU Table:         [ 4724 taxa and 100 samples ]
+sample_data() Sample Data:       [ 100 samples by 30 sample variables ]
+tax_table()   Taxonomy Table:    [ 4724 taxa by 7 taxonomic ranks ]
+phy_tree()    Phylogenetic Tree: [ 4724 tips and 4722 internal nodes ]
+
+> Bacteria_ps_filtered_nochlormito
+phyloseq-class experiment-level object
+otu_table()   OTU Table:         [ 4724 taxa and 100 samples ]
+sample_data() Sample Data:       [ 100 samples by 30 sample variables ]
+tax_table()   Taxonomy Table:    [ 4724 taxa by 7 taxonomic ranks ]
+phy_tree()    Phylogenetic Tree: [ 4724 tips and 4722 internal nodes ]
+
+##### Files for all figures from the above code.
+1.For Fig 1 : "physeq_rarefied.rds"
+2.For Fig 2, Fig 3, Fig 4, Fig 5 : "Bacteria_ps_filtered_clean.rds" 
+3.For Fig 6, 7 and S11: Bacteria_ps_filtered_nochlormito.rmds
+
+

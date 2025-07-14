@@ -1,0 +1,819 @@
+---
+title: "FigS8_PlanttraitRDA"
+output: html_document
+date: "`r Sys.Date()`"
+author: "Sachin naik"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+########################################
+# Load necessary libraries
+########################################
+library(phyloseq)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(cowplot)
+library(vegan)
+library(ggrepel)
+library(tidyverse)
+library(ggnewscale)
+
+
+########################################
+# 1) Read and prepare data
+########################################
+
+# Read the phyloseq object
+physeq_filterednochloromito <- readRDS("Bacteria_ps_filtered_nochlormito.rds")
+
+# Read sample metadata with plant traits
+sample_info_tab <- read.csv("SNGH4N_leachate_planttrait_shoot.csv", 
+                            header = TRUE, 
+                            row.names = 1,
+                            check.names = FALSE)
+
+# Convert to sample_data object 
+sample_data_object <- sample_data(sample_info_tab)
+colnames(sample_info_tab)
+# Replace sample data instead of merging to avoid duplicate column issues
+sample_data(physeq_filterednochloromito) <- sample_data_object
+merged_physeq <- physeq_filterednochloromito
+
+# Normalize Data
+merged_physeq <- transform_sample_counts(merged_physeq, function(x) x / sum(x))
+
+########################################
+# 2) Extract Genus-level data
+########################################
+Genus_data <- tax_glom(merged_physeq, taxrank = "Genus")
+Genus_rel_abund <- transform_sample_counts(Genus_data, function(x) x / sum(x))
+
+# Extract the Genus names from the tax_table
+tax_table_df <- as.data.frame(tax_table(Genus_rel_abund))
+Genus_names <- tax_table_df$Genus
+
+# Shorten specific genus names
+Genus_names <- ifelse(
+  Genus_names %in% c("Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium"), 
+  "Rhizobium", 
+  ifelse(
+    Genus_names %in% c("Burkholderia-Caballeronia-Paraburkholderia"), 
+    "Burkholderia",
+    ifelse(
+      Genus_names %in% c("Methylobacterium-Methylorubrum"), 
+      "Methylobacterium",
+      Genus_names
+    ))
+)
+
+# Create a new otu_table with Genus names as column names
+Genus_table <- otu_table(Genus_rel_abund)
+Genus_table <- t(Genus_table) # Transpose to have samples as rows
+colnames(Genus_table) <- Genus_names
+
+########################################
+# 3) Select all Genera for analysis
+########################################
+Genus_sums <- colSums(Genus_table)
+all_percent <- Genus_sums >= quantile(Genus_sums, 0)
+top_genus <- Genus_table[, all_percent, drop = FALSE]
+
+```
+
+
+```{r}
+########################################
+# 4) Extract plant trait variables
+########################################
+# List of all plant traits slected after removing all vif vlaues greater than 10
+plant_traits <- c("Hue_0_30_pct",
+                  "Leaf_Area", 
+                  "PSRI_Average", "Hue_90_180_pct"
+)
+
+# Extract plant trait data from sample_data, keeping only traits present in metadata
+available_traits <- intersect(plant_traits, colnames(sample_data(merged_physeq)))
+plant_trait_data <- data.frame(sample_data(merged_physeq)[, available_traits])
+
+# Add pH and Plant variables for combined analysis
+env_data <- as(sample_data(merged_physeq), "data.frame") %>%
+  select(pH, Plant, all_of(available_traits)) %>%
+  na.omit()
+
+########################################
+# 5) RDA Analysis with plant traits
+########################################
+
+# Align samples between genus and environmental data
+common_samples <- intersect(rownames(top_genus), rownames(env_data))
+Genus_table_subset <- top_genus[common_samples, ]
+env_data_subset <- env_data[common_samples, ]
+
+# Check DCA axis length to confirm RDA is appropriate
+dca_result <- decorana(Genus_table_subset)
+print(paste("DCA1 axis length:", dca_result$evals[1]))
+
+# Run a preliminary PCA on plant traits to identify major axes of variation
+trait_pca <- prcomp(env_data_subset[, -c(1,2)], scale. = TRUE)
+summary(trait_pca)
+# Select the top plant traits by PCA contribution
+top_trait_loadings <- abs(trait_pca$rotation[, 1:4])
+top_traits <- names(sort(rowSums(top_trait_loadings), decreasing = TRUE)[1:4])
+
+
+# Prepare final environmental data with pH, Plant, and top traits
+env_data_final <- env_data_subset %>%
+  select(pH, Plant, all_of(top_traits))
+
+# Perform global RDA with pH, Plant, and plant traits
+global_rda <- rda(Genus_table_subset ~ ., data = env_data)
+summary(global_rda)
+
+# Check for multicollinearity
+vif_values <- vif.cca(global_rda)
+print(vif_values)
+
+# Test significance of the global model
+anova_global <- anova(global_rda)
+print(anova_global)
+
+# Test significance of individual terms
+anova_terms <- anova(global_rda, by = "terms")
+print(anova_terms)
+
+# Forward selection to identify significant variables
+set.seed(1987)
+significant_vars <- ordistep(rda(Genus_table_subset ~ 1, data = env_data_final), 
+                             scope = formula(global_rda), 
+                             direction = "forward",
+                             perm.max = 9999)
+print(significant_vars)
+
+```
+
+```{r}
+# Ensure data consistency
+genus_clean <- Genus_table[common_samples, ]
+env_clean <- env_data[common_samples, ]
+
+# Verify final alignment
+stopifnot(nrow(genus_clean) == nrow(env_clean))
+stopifnot(all(rownames(genus_clean) == rownames(env_clean)))
+
+
+# Extract scores with explicit sample alignment
+sites_scores <- scores(significant_vars, display = "sites", choices = c(1,2))
+species_scores <- scores(significant_vars, display = "species", choices = c(1,2))
+env_scores <- scores(significant_vars, display = "bp", choices = c(1,2))
+centroids_scores <- scores(significant_vars, display = "cn", choices = c(1,2))
+print(species_scores)
+print(centroids_scores)
+
+
+# Verify score dimensions
+cat("Sites scores dimensions:", dim(sites_scores), "\n")
+cat("Species scores dimensions:", dim(species_scores), "\n")
+cat("Environmental scores dimensions:", dim(env_scores), "\n")
+cat("Centroids scores dimensions:", dim(centroids_scores), "\n")
+
+# Extract scores manually
+sites <- scores(significant_vars, display = "sites", choices = c(1,2))
+env_scores_continuous <- scores(significant_vars, display = "bp", choices = c(1,2))
+centroids <- scores(significant_vars, display = "cn", choices = c(1,2))
+
+# Filter to show only continuous variables as arrows
+continuous_vars <- c("pH",  "Leaf_Area", "PSRI_Average", "Hue_0_30_pct")
+env_scores_filtered <- env_scores_continuous[rownames(env_scores_continuous) %in% continuous_vars, ]
+
+print(env_scores_filtered)
+
+# Modified ellipse calculation with error checking
+veganCovEllipse <- function(cov, center = c(0,0), scale = 1, npoints = 100) {
+  theta <- (0:npoints) * 2 * pi/npoints
+  Circle <- cbind(cos(theta), sin(theta))
+  t(center + scale * t(Circle %*% chol(cov)))
+}
+
+```
+
+```{r}
+# First, let's check what's happening with your Plant variable
+print("Plant variable summary:")
+print(table(env_data$Plant, useNA = "always"))
+print("Plant variable type:")
+print(class(env_data$Plant))
+print("Plant levels (if factor):")
+print(levels(env_data$Plant))
+
+# Check sample distribution
+print("Sample distribution per plant:")
+print(summary(env_data$Plant))
+
+# Convert Plant to proper factor with explicit levels
+env_data <- env_data %>%
+  mutate(Plant = case_when(
+    Plant == "empty" ~ "Empty", 
+    Plant == "geranium" ~ "Geranium", 
+    Plant == "marigold" ~ "Marigold",
+    Plant == "petunia" ~ "Petunia",
+    Plant == "tomato" ~ "Tomato",
+    TRUE ~ as.character(Plant)  # Keep any other values
+  )) %>%
+  mutate(Plant = factor(Plant, 
+                        levels = c( "Empty","Geranium", "Marigold", "Petunia", "Tomato")))
+
+# Verify the factor conversion worked
+print("After factor conversion:")
+print(table(env_data$Plant, useNA = "always"))
+print(levels(env_data$Plant))
+
+# Modified ellipse calculation with better error handling and debugging
+calculate_ellipses <- function(rda_obj, plant_factor, min_points = 3) {
+  ellipse_data <- data.frame()
+  site_scores <- scores(rda_obj, display = "sites", choices = c(1,2))
+  
+  cat("Function input check:\n")
+  cat("Plant factor levels:", levels(plant_factor), "\n")
+  cat("Number of samples:", length(plant_factor), "\n")
+  cat("Site scores dimensions:", dim(site_scores), "\n")
+  
+  for(group in levels(plant_factor)) {
+    cat("\nProcessing group:", group, "\n")
+    group_indices <- which(plant_factor == group)
+    cat("Group indices found:", length(group_indices), "\n")
+    
+    if(length(group_indices) >= min_points) {  # Need at least min_points for ellipse
+      group_scores <- site_scores[group_indices, , drop = FALSE]
+      cat("Group scores dimensions:", dim(group_scores), "\n")
+      
+      # Check if we have valid scores
+      if(all(is.finite(group_scores)) && nrow(group_scores) >= min_points) {
+        tryCatch({
+          cov_mat <- cov(group_scores)
+          center <- colMeans(group_scores)
+          
+          cat("Covariance matrix determinant:", det(cov_mat), "\n")
+          
+          # Only proceed if covariance matrix is valid
+          if(all(is.finite(cov_mat)) && det(cov_mat) > 1e-10) {
+            ellipse_points <- veganCovEllipse(cov_mat, center, scale = 1)
+            new_data <- data.frame(ellipse_points, Group = group)
+            colnames(new_data) <- c("RDA1", "RDA2", "Group")
+            ellipse_data <- rbind(ellipse_data, new_data)
+            cat("Ellipse created successfully for", group, "\n")
+          } else {
+            cat("Invalid covariance matrix for", group, "\n")
+          }
+        }, error = function(e) {
+          cat("Error creating ellipse for", group, ":", e$message, "\n")
+        })
+      } else {
+        cat("Invalid or insufficient group scores for", group, "\n")
+      }
+    } else {
+      cat("Not enough points for", group, "- need at least", min_points, "but have", length(group_indices), "\n")
+    }
+  }
+  
+  cat("\nFinal ellipse data dimensions:", dim(ellipse_data), "\n")
+  return(ellipse_data)
+}
+
+# Ensure plant_groups is properly set as a factor
+plant_groups <- env_data$Plant
+
+# Calculate ellipses with debugging
+ellipse_data <- calculate_ellipses(significant_vars, plant_groups, min_points = 3)
+
+# Check the result
+print("Final ellipse data:")
+print(head(ellipse_data))
+print(dim(ellipse_data))
+```
+
+
+```{r}
+global_plot <- ggplot() +
+  # Add ellipse outlines first (no fill) with custom colors
+  {if(nrow(ellipse_data) > 0)
+    geom_polygon(data = ellipse_data,
+                 aes(RDA1, RDA2, group = Group, color = Group),
+                 fill = NA, # No fill - transparent ellipses
+                 linewidth = 1.2, # Thicker lines for visibility
+                 linetype = 2, # Dashed lines
+                 show.legend = TRUE)
+  } +
+  # Set colors for ellipses
+  scale_color_manual(values = ellipse_colors, name = "Plant Groups") +
+  # Start new color scale for pH points
+  new_scale_color() +
+  # Plot sites (samples) with pH color scale
+  geom_point(data = as.data.frame(sites),
+             aes(RDA1, RDA2, color = env_data$pH, shape = env_data$Plant),
+             size = 4, alpha = 0.8) +
+  
+  # Plot pH arrow in BLUE
+  geom_segment(data = filter(env_scores, Variable == "pH"),
+               aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+               arrow = arrow(length = unit(0.2, "cm")), color = "blue", linewidth = 1) +
+  
+  # Plot arrows for other environmental variables in RED
+  geom_segment(data = filter(env_scores, Variable != "pH"),
+               aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+               arrow = arrow(length = unit(0.2, "cm")), color = "red", linewidth = 1) +
+  
+  # Add labels for environmental variables
+  geom_text_repel(data = env_scores,
+                  aes(RDA1, RDA2, label = Variable),
+                  color = "black", fontface = "bold", size = 6, max.overlaps = 60) +
+  # Add blue asterisks for significant variables
+  geom_text(data = filter(env_scores, is_sig),
+            aes(RDA1_adj, RDA2_adj, label = "*"),
+            color = "red", size = 11, fontface = "bold", max.overlaps = 30) +
+  # Add centroids for Plant factor
+  geom_point(data = as.data.frame(centroids),
+             aes(x = RDA1, y = RDA2),
+             color = "blue", size = 5, shape = 15) +
+  # Add labels with calculated nudge directions
+  geom_text_repel(
+    data = centroid_df,
+    aes(x = RDA1, y = RDA2, label = label),
+    color = "blue",
+    fontface = "bold",
+    size = 5,
+    min.segment.length = 0,
+    segment.color = "blue",
+    segment.size = 1,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    max.overlaps = 50
+  ) +
+  # pH color scale for points
+  scale_color_gradientn(
+    colors = custom_colors2,
+    values = scales::rescale(c(4.5, 5.5, 6.2, 7)),
+    breaks = c(4.5, 5.5, 6.2, 7),
+    name = "pH"
+  ) +
+  scale_shape_manual(values = custom_shapes, name = "Plant") +
+  # Labels and titles
+  labs(title = "Global RDA of genus-level microbial community: Plant growth traits",
+       x = paste0("RDA1 (", rda1_percent, "%)"),
+       y = paste0("RDA2 (", rda2_percent, "%)")) +
+  # Theme customization for RIGHT legend
+  theme_minimal() +
+  theme(
+    axis.line = element_line(color = "black"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    axis.ticks = element_line(color = "black"),
+    axis.text = element_text(size = 14, color = "black"),
+    axis.title = element_text(size = 16, face = "bold"),
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 12, color = "gray40"),
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.text = element_text(size = 9), # Reduced text size
+    legend.title = element_text(face = "bold", size = 10), # Reduced title size
+    legend.key.size = unit(0.8, "cm"), # Reduced key size
+    legend.margin = margin(l = 10, r = 10) # Add margins
+  ) +
+  guides(
+    # FOR RIGHT POSITION: Use barheight instead of barwidth
+    color = guide_colorbar(
+      title.position = "top",
+      barheight = unit(4, "cm"), # Use barheight for vertical colorbar
+      barwidth = unit(0.5, "cm"), # Narrow width for right position
+      ticks.colour = "black",
+      frame.colour = "black"
+    ),
+    shape = guide_legend(
+      title.position = "top",
+      ncol = 1, # Single column for right position
+      byrow = TRUE
+    )
+  )
+global_plot
+
+```
+
+```{r}
+# 5) Define correlation functions
+# Load necessary libraries
+library(phyloseq)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(cowplot)
+
+########################################
+ #Correlation Analysis for Plant Traits
+########################################
+# List of all plant traits 
+colnames(sample_data_object)
+plant_traits <- c(
+  "Hue_0_30_pct" ,"Hue_90_180_pct",   "Leaf_Area", "PSRI_Average"     
+)
+
+# Extract plant trait data from sample_data, keeping only traits present in metadata
+available_traits <- intersect(plant_traits, colnames(sample_data(merged_physeq)))
+plant_trait_data <- data.frame(sample_data(merged_physeq)[, available_traits])
+
+# Add pH and Plant variables for combined analysis
+env_data <- as(sample_data(merged_physeq), "data.frame") %>%
+  select(pH, Plant, all_of(available_traits)) %>%
+  na.omit()
+
+
+
+# Extract genus data and key plant trait data
+genus_data <- as.data.frame(top_genus)
+env_data_subset <- env_data[common_samples, ]
+env_data
+# Method 1: Directly specify the significant plant trait variables
+sig_var_names <- c("Hue_0_30_pct","Hue_90_180_pct", "Leaf_Area", "PSRI_Average")
+
+
+# Now subset the data frame with these variables
+plant_trait_subset <- env_data_subset[, sig_var_names, drop = FALSE]
+########################################
+# 5) Define correlation functions
+########################################
+# FIRST define the function
+correlation_with_pvalues <- function(Genus_data, trait_data, method = "spearman") {
+  # Correlation matrix
+  cor_matrix <- cor(Genus_data, trait_data, method = method, use = "complete.obs")
+  
+  # Initialize p-value matrix
+  p_matrix <- matrix(
+    NA, 
+    nrow = ncol(Genus_data), 
+    ncol = ncol(trait_data),
+    dimnames = list(colnames(Genus_data), colnames(trait_data))
+  )
+  
+  # Loop through each pair, run cor.test, save p-values
+  for (i in 1:ncol(Genus_data)) {
+    for (j in 1:ncol(trait_data)) {
+      test <- cor.test(Genus_data[, i], trait_data[, j], method = method)
+      p_matrix[i, j] <- test$p.value
+    }
+  }
+  
+  list(correlation = cor_matrix, pvalues = p_matrix)
+}
+
+# THEN call the function
+plant_trait_correlations <- correlation_with_pvalues(genus_data, plant_trait_subset, method = "spearman")
+
+# Function to compute correlation and p-values
+correlation_with_pvalues <- function(Genus_data, trait_data, method = "spearman") {
+  # Correlation matrix
+  cor_matrix <- cor(Genus_data, trait_data, method = method, use = "complete.obs")
+  
+  # Initialize p-value matrix
+  p_matrix <- matrix(
+    NA, 
+    nrow = ncol(Genus_data), 
+    ncol = ncol(trait_data),
+    dimnames = list(colnames(Genus_data), colnames(trait_data))
+  )
+  
+  # Loop through each pair, run cor.test, save p-values
+  for (i in 1:ncol(Genus_data)) {
+    for (j in 1:ncol(trait_data)) {
+      test <- cor.test(Genus_data[, i], trait_data[, j], method = method)
+      p_matrix[i, j] <- test$p.value
+    }
+  }
+  
+  list(correlation = cor_matrix, pvalues = p_matrix)
+}
+
+# Function to create correlation heatmaps
+create_correlation_plot <- function(cor_matrix, p_matrix, title) {
+  plot_data <- reshape2::melt(cor_matrix) %>%
+    dplyr::rename(Genus = Var1, Trait = Var2, Correlation = value) %>%
+    dplyr::left_join(
+      reshape2::melt(p_matrix) %>%
+        dplyr::rename(Genus = Var1, Trait = Var2, Pvalue = value),
+      by = c("Genus", "Trait")
+    )
+  
+  # Define significance levels and labels
+  plot_data <- plot_data %>%
+    dplyr::mutate(
+      Significance = dplyr::case_when(
+        Pvalue < 0.001 ~ "***",
+        Pvalue < 0.01  ~ "**",
+        Pvalue < 0.05  ~ "*",
+        TRUE           ~ ""
+      ),
+      Label = ifelse(
+        Significance != "",
+        paste0(format(round(Correlation, 2), nsmall = 2), Significance),
+        ""
+      )
+    )
+  
+  # Filter for significant correlations
+  plot_data_significant <- dplyr::filter(plot_data, Pvalue < 0.05 & abs(Correlation) >= 0.4)
+  
+  # Ensure genus names are character type before sorting
+  sorted_genera <- sort(as.character(unique(plot_data_significant$Genus)))
+  
+  # Create a factor with explicit levels in alphabetical order
+  plot_data_significant$Genus <- factor(plot_data_significant$Genus, 
+                                        levels = sorted_genera,
+                                        ordered = TRUE)
+  
+  # Sort data frame by Genus to ensure correct order
+  plot_data_significant <- plot_data_significant %>%
+    dplyr::arrange(Genus)
+  
+  # Create the heatmap
+  ggplot(plot_data_significant, aes(x = Trait, y = Genus, fill = Correlation)) +
+    # Explicitly set y-axis order
+    scale_y_discrete(limits = sorted_genera) +
+    # Visible borders around tiles
+    geom_tile(color = "black", size = 0.3) +
+    
+    # Two-color gradient (blue-white-red) for correlation
+    scale_fill_gradient2(
+      low = "#241571",
+      mid = "white",
+      high = "#BF0A30",
+      midpoint = 0,
+      limit = c(-1, 1),
+      name = "Spearman\nCorrelation"
+    ) +
+    
+    # Add correlation values and significance
+    geom_text(aes(label = Label), color = "white", size = 3) +
+    
+    labs(title = title) +
+    
+    # Use theme_bw to get visible grid lines/borders
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 16)
+    )
+}
+
+# Create the correlation heatmap for plant traits
+plant_trait_correlation_plot <- create_correlation_plot(
+  plant_trait_correlations$correlation, 
+  plant_trait_correlations$pvalues, 
+  "Genus vs Plant Trait Correlations"
+)
+
+# Function to create parallel heatmaps
+create_parallel_heatmaps <- function(cor_matrix, p_matrix, genus_table, trait_data, title) {
+  # Process correlation data
+  plot_data <- reshape2::melt(cor_matrix) %>%
+    dplyr::rename(Genus = Var1, Trait = Var2, Correlation = value) %>%
+    dplyr::left_join(
+      reshape2::melt(p_matrix) %>%
+        dplyr::rename(Genus = Var1, Trait = Var2, Pvalue = value),
+      by = c("Genus", "Trait")
+    ) %>%
+    dplyr::mutate(
+      Significance = dplyr::case_when(
+        Pvalue < 0.001 ~ "***",
+        Pvalue < 0.01  ~ "**",
+        Pvalue < 0.05  ~ "*",
+        TRUE           ~ ""
+      ),
+      Label = ifelse(
+        Significance != "",
+        paste0(format(round(Correlation, 2), nsmall = 2), Significance),
+        ""
+      )
+    )
+  
+  # Filter for significant correlations
+  plot_data_significant <- dplyr::filter(plot_data, Pvalue < 0.05 & abs(Correlation) >= 0.4)
+  
+  # Get the significant genus-trait pairs
+  significant_pairs <- plot_data_significant %>% 
+    dplyr::select(Genus, Trait) %>% 
+    dplyr::distinct()
+  
+  # Ensure genus names are character type before sorting
+  significant_genera <- sort(as.character(unique(significant_pairs$Genus)))
+  
+  # Create abundance data for the same genus-trait pairs
+  abundance_data <- data.frame()
+  prevalence_data <- data.frame()
+  
+  for (i in 1:nrow(significant_pairs)) {
+    g <- significant_pairs$Genus[i]
+    t <- significant_pairs$Trait[i]
+    
+    # For each trait, divide samples into high/low based on median
+    trait_median <- median(trait_data[[t]], na.rm = TRUE)
+    high_samples <- trait_data[[t]] > trait_median & !is.na(trait_data[[t]])
+    
+    # Calculate mean abundance for this genus in samples with high trait value
+    mean_abundance <- mean(genus_table[high_samples, g], na.rm = TRUE)
+    
+    # Calculate prevalence (proportion of samples where present)
+    prevalence <- mean(genus_table[high_samples, g] > 0, na.rm = TRUE)
+    
+    # Convert prevalence to percentage (0-100 instead of 0-1)
+    prevalence <- prevalence * 100
+    
+    # Add to data frames
+    abundance_data <- rbind(abundance_data, data.frame(
+      Genus = g, Trait = t, Abundance = mean_abundance
+    ))
+    
+    prevalence_data <- rbind(prevalence_data, data.frame(
+      Genus = g, Trait = t, Prevalence = prevalence
+    ))
+  }
+  
+  # Apply consistent ordering by explicitly setting factor levels in alphabetical order
+  plot_data_significant$Genus <- factor(plot_data_significant$Genus, 
+                                        levels = significant_genera,
+                                        ordered = TRUE)
+  abundance_data$Genus <- factor(abundance_data$Genus, 
+                                 levels = significant_genera,
+                                 ordered = TRUE)
+  prevalence_data$Genus <- factor(prevalence_data$Genus, 
+                                  levels = significant_genera,
+                                  ordered = TRUE)
+  
+  # Log-transform abundance for better visualization
+  abundance_data$log_abundance <- log10(abundance_data$Abundance + 1)
+  
+  # Define grayscale palette for abundance (gray to black)
+  gray_palette <- colorRampPalette(c("#CCCCCC", "#666666", "#000000"))(100)
+  
+  # Define a colorblind-friendly green color palette for prevalence
+  green_palette <- colorRampPalette(c("#E5F5E0", "#74C476", "#006D2C"))(100)
+  
+  # Create legend-ready versions of each plot (with legends)
+  correlation_plot_with_legend <- ggplot(plot_data_significant, 
+                                         aes(x = Trait, y = Genus, fill = Correlation)) +
+    geom_tile(color = "black", size = 0.3) +
+    scale_fill_gradient2(
+      low = "#241571", mid = "white", high = "#BF0A30",
+      midpoint = 0, limit = c(-1, 1),
+      name = "Spearman\nCorrelation"
+    ) +
+    scale_y_discrete(limits = significant_genera) +
+    geom_text(aes(label = Label), color = "white", size = 2) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "right")
+  
+  abundance_plot_with_legend <- ggplot(abundance_data, 
+                                       aes(x = Trait, y = Genus, fill = log_abundance)) +
+    geom_tile(color = "black", size = 0.3) +
+    scale_fill_gradientn(colors = gray_palette, name = "Log10\nAbundance") +
+    scale_y_discrete(limits = significant_genera) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "right")
+  
+  prevalence_plot_with_legend <- ggplot(prevalence_data, 
+                                        aes(x = Trait, y = Genus, fill = Prevalence)) +
+    geom_tile(color = "black", size = 0.3) +
+    scale_fill_gradientn(colors = green_palette, name = "Prevalence (%)") +
+    scale_y_discrete(limits = significant_genera) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "right")
+  
+  # Extract the legends
+  correlation_legend <- cowplot::get_legend(correlation_plot_with_legend)
+  abundance_legend <- cowplot::get_legend(abundance_plot_with_legend)
+  prevalence_legend <- cowplot::get_legend(prevalence_plot_with_legend)
+  
+  # Create a combined legend
+  legend_combined <- cowplot::plot_grid(
+    correlation_legend,
+    abundance_legend,
+    prevalence_legend,
+    ncol = 1,
+    align = "v"
+  )
+  
+  # Create versions of each plot without legends but WITH y-axis labels
+  correlation_plot <- ggplot(plot_data_significant, 
+                             aes(x = Trait, y = Genus, fill = Correlation)) +
+    geom_tile(color = "black", size = 0.3) +
+    scale_fill_gradient2(
+      low = "#241571", mid = "white", high = "#BF0A30",
+      midpoint = 0, limit = c(-1, 1)
+    ) +
+    scale_y_discrete(limits = significant_genera) +
+    geom_text(aes(label = Label), color = "white", size = 2) +
+    labs(title = "Correlation") +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 14),
+      legend.position = "none"
+    )
+  
+  abundance_plot <- ggplot(abundance_data, 
+                           aes(x = Trait, y = Genus, fill = log_abundance)) +
+    geom_tile(color = "black", size = 0.3) +
+    scale_fill_gradientn(colors = gray_palette) +
+    scale_y_discrete(limits = significant_genera) +
+    labs(title = "Abundance") +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 14),
+      legend.position = "none"
+    )
+  
+  prevalence_plot <- ggplot(prevalence_data, 
+                            aes(x = Trait, y = Genus, fill = Prevalence)) +
+    geom_tile(color = "black", size = 0.3) +
+    scale_fill_gradientn(colors = green_palette) +
+    scale_y_discrete(limits = significant_genera) +
+    labs(title = "Prevalence") +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 14),
+      legend.position = "none"
+    )
+  
+  # Combine plots with the combined legend on the right
+  plots_row <- cowplot::plot_grid(
+    correlation_plot, abundance_plot, prevalence_plot,
+    ncol = 3, 
+    align = "h",
+    axis = "tb", # align top and bottom
+    rel_widths = c(1.2, 1.1, 1.1)  # Make middle and right plots wider
+  )
+  
+  final_plot <- cowplot::plot_grid(
+    plots_row, legend_combined,
+    ncol = 2,
+    rel_widths = c(3, 0.5)
+  )
+  
+  return(final_plot)
+}
+# Create parallel heatmaps for plant traits
+plant_trait_parallel_heatmaps <- create_parallel_heatmaps(
+  plant_trait_correlations$correlation, 
+  plant_trait_correlations$pvalues, 
+  genus_data,
+  plant_trait_subset,
+  "Plant Trait Correlation, Abundance & Prevalence"
+)
+print(plant_trait_parallel_heatmaps)
+
+
+```
+
+```{r}
+###need to reun the above global plot alone to fix the genus dot colors to redisplay..weird but this the way its work
+# Combine top_genera_correlation_plot (A) and parallel_heatmaps (B) vertically
+combined_plot <- plot_grid(
+  global_plot,  # Plot A
+  plant_trait_parallel_heatmaps,           # Plot B
+  ncol = 1,                    # Arrange plots in a single column
+  rel_heights = c(1, 1.8),     # Adjust relative heights
+  rel_widths = c(1,1.5),
+  align = 'v',                 # Align plots vertically
+  labels = c("A", "B"),        # Add labels to identify each plot
+  label_size = 18              # Make labels larger
+)
+
+# Display the combined plot
+print(combined_plot)
+
+```
+
+```{r}
+# Save the combined plot as a high-resolution PNG file
+ggsave("RDA_plots/Figure8_combined_plotRDAnew1.jpeg", plot = combined_plot, width = 16, height = 16, dpi = 600)
+ggsave("RDA_plots/Figure8_combined_plotRDAnew1.tiff", plot = combined_plot, width = 16, height = 16, dpi = 600)
+ggsave("RDA_plots/Figure8_combined_plotRDAnew1.pdf", plot = combined_plot, width = 16, height = 16, dpi = 600)
+
+
+```
