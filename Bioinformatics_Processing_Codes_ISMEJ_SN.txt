@@ -141,7 +141,7 @@ filtFs <- sort(list.files(path, "_F_filt.fastq", full.names = TRUE))
 filtRs <- sort(list.files(path, "_R_filt.fastq", full.names = TRUE))
 
 errF <- learnErrors(filtFs, nbases = 2.5e9, multithread = TRUE, randomize = TRUE, MAX_CONSIST = 20, verbose = TRUE)
-errR <- learnErrors(filtRs, nbases = 7e8,  multithread = TRUE, randomize = TRUE, MAX_CONSIST = 20, verbose = TRUE)
+errR <- learnErrors(filtRs, nbases = 1e9,  multithread = TRUE, randomize = TRUE, MAX_CONSIST = 20, verbose = TRUE)
 
 saveRDS(errF, "errF.rds"); saveRDS(errR, "errR.rds")
 png("errorplot_errF.png"); plotErrors(errF, nominalQ = TRUE); dev.off()
