@@ -403,6 +403,6 @@ phy_tree()    Phylogenetic Tree: [ 4724 tips and 4722 internal nodes ]
 ##### Files for all figures from the above code.
 1.For Fig 1 : "physeq_rarefied.rds"
 2.For Fig 2, Fig 3, Fig 4, Fig 5 : "Bacteria_ps_filtered_clean.rds" 
-3.For Fig 6, 7 and S11: Bacteria_ps_filtered_nochlormito.rmds
+3.For Fig 6, 7 and S4: Bacteria_ps_filtered_nochlormito.rmds
 
 
